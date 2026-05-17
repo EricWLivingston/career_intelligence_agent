@@ -21,4 +21,5 @@ dependencies = [
     "jupyter>=1.1.1",
     "google-api-python-client>=2.196.0",
     "tavily-python>=0.3.0",
+    "langgraph-checkpoint-sqlite",
 ]

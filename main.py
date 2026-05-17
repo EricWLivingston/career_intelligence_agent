@@ -1,5 +1,6 @@
 import argparse
 import json
+import sqlite3
 import sys
 import time
 import uuid
@@ -8,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_core.messages import SystemMessage
 from lib.tools import (
     get_current_time,
@@ -111,7 +112,7 @@ def build_agents():
         subagents=SUBAGENTS,
         backend=FilesystemBackend(root_dir=".", virtual_mode=True),
         skills=["./skills/"],
-        checkpointer=MemorySaver(),
+        checkpointer=SqliteSaver(sqlite3.connect("./state.db", check_same_thread=False)),
     )
 
 
@@ -152,8 +153,7 @@ def run_agent(message: str, thread_id: str) -> str:
 # Chat trigger
 # ---------------------------------------------------------------------------
 
-def run_chat() -> None:
-    thread_id = f"chat-{uuid.uuid4().hex[:8]}"
+def run_chat(thread_id: str = "chat-main") -> None:
     print(f"Career Intelligence Agent ready (session: {thread_id}). Type 'exit' to quit.")
     while True:
         user_input = input("\nYou: ").strip()
@@ -238,9 +238,14 @@ if __name__ == "__main__":
         default=60,
         help="Poll interval in seconds (gmail mode only, default 60)",
     )
+    parser.add_argument(
+        "--thread",
+        default="chat-main",
+        help="Thread ID for chat session (default: 'chat-main', persisted across restarts)",
+    )
     args = parser.parse_args()
 
     if args.mode == "gmail":
         run_gmail_trigger(query=args.query, poll_interval=args.interval)
     else:
-        run_chat()
+        run_chat(thread_id=args.thread)
