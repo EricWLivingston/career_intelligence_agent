@@ -1,0 +1,6 @@
+﻿GMAIL TRIGGER FORMAT
+[{"id":"19d601e4986b186b","threadId":"19d601e4986b186b","snippet":"this is a test in the body","payload":{"mimeType":"multipart/alternative"},"sizeEstimate":7015,"historyId":"1347","internalDate":"1775434079000","labels":[{"id":"INBOX","name":"INBOX"},{"id":"CATEGORY_PERSONAL","name":"CATEGORY_PERSONAL"},{"id":"UNREAD","name":"UNREAD"}],"From":"Eric Livingston <ericlivingston0@gmail.com>","Subject":"this is a test","To":"\"researchagent69@gmail.com\" <researchagent69@gmail.com>","trigger_source":"gmail"}]
+
+
+CHAT TRIGGER FORMAT
+[{"action":"sendMessage","sessionId":"b18556dd955840fdae2c89f4a52c7735","chatInput":"THIS IS A TEST MESSAGE", "trigger_source": "chat"}]

@@ -1,0 +1,794 @@
+================================================================================
+  tools.py — Full Code Walkthrough
+  Audience: comfortable with C, newer to Python and high-level APIs
+================================================================================
+
+This file defines every external action the AI agent can take: read/write
+Google Sheets, create/read/write Google Docs, read/send Gmail, and search for
+job listings via the JSearch API. Each action is wrapped in a @tool decorator
+that registers it with the LangChain framework so the agent can call it by
+name.
+
+Think of this file as a collection of driver functions. The Google APIs are
+the hardware; this file is the HAL (hardware abstraction layer) that the agent
+calls into.
+
+────────────────────────────────────────────────────────────────────────────────
+IMPORTS
+────────────────────────────────────────────────────────────────────────────────
+
+    import base64
+    import json
+    import os
+    from datetime import datetime, timezone
+    from email.mime.text import MIMEText
+    from typing import Literal
+
+Python's standard library. No installation needed.
+
+  base64            — encodes/decodes binary data to ASCII text. Gmail's API
+                      requires email bytes to be base64url-encoded before
+                      transmission (same concept as Base64 encoding in
+                      embedded/network protocols).
+
+  json              — serializes Python dicts/lists to JSON strings and back.
+                      Think of it as sprintf/sscanf for structured data.
+
+  os                — access to environment variables (os.getenv), file
+                      existence checks (os.path.exists). Equivalent to
+                      getenv() in C.
+
+  datetime/timezone — standard library date/time types. datetime.now(utc)
+                      returns the current moment as a timezone-aware object.
+                      Used by the get_current_time tool.
+
+  MIMEText          — builds a properly formatted email message (headers +
+                      body) in the MIME standard that email servers expect.
+
+  Literal           — a type annotation that restricts a parameter to a fixed
+                      set of string values, like a C enum. Used by
+                      jsearch_request to accept only "search" or "job-details".
+
+    import httpx
+    import gspread
+    from google.oauth2.service_account import Credentials
+    from google.oauth2.credentials import Credentials as OAuthCredentials
+    from google.auth.transport.requests import Request
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+    from langchain.tools import tool
+    from langchain_openai import ChatOpenAI
+    from langchain_core.messages import HumanMessage
+
+Third-party libraries installed via pip/uv.
+
+  httpx            — HTTP client library. Like libcurl but with a cleaner
+                     Python interface. Used for JSearch API calls.
+
+  gspread          — Google Sheets client. Wraps the Sheets REST API so you
+                     can read/write rows without writing raw HTTP calls.
+
+  Credentials      — holds a service account's credentials (a JSON key file).
+                     Service accounts are bot identities that can access
+                     Google Workspace resources without a human signing in.
+
+  OAuthCredentials — holds a real user's OAuth2 tokens (access token +
+                     refresh token). Required for Gmail because Gmail does not
+                     grant service accounts access to personal inboxes.
+
+  Request          — a transport adapter that lets the Google auth library
+                     make HTTP requests to refresh an expired OAuth token.
+
+  InstalledAppFlow — runs the OAuth2 "installed app" flow: opens a browser,
+                     the user logs in, Google issues tokens, they get saved.
+                     Only needed once; thereafter the saved token is reused.
+
+  build            — Google API client factory. build("docs", "v1", ...) returns
+                     a Python object whose methods map 1-to-1 with the Docs
+                     REST API endpoints.
+
+  tool             — LangChain decorator. Wrapping a function with @tool
+                     registers it as a callable tool for the AI agent. The
+                     agent reads the function's docstring to understand what
+                     the tool does and when to call it.
+
+  ChatOpenAI       — LangChain wrapper around OpenAI's chat models. Used
+                     inside _summarize_job_descriptions to call GPT-4.1-nano
+                     for compressing job descriptions before they're returned
+                     to the agent.
+
+  HumanMessage     — a LangChain message type representing a user turn. Used
+                     to construct the prompt passed to ChatOpenAI.
+
+────────────────────────────────────────────────────────────────────────────────
+MODULE-LEVEL CONSTANTS AND STATE
+────────────────────────────────────────────────────────────────────────────────
+
+    _SA_SCOPES = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/documents",
+    ]
+    _GMAIL_SCOPES = [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/gmail.compose",
+    ]
+
+OAuth2 "scopes" are permission strings — they declare exactly which Google
+APIs the credentials are allowed to call. Google enforces these server-side;
+requesting a scope you didn't declare will result in a permission error.
+_SA_SCOPES is for the service account (Sheets + Docs). _GMAIL_SCOPES is for
+the user's Gmail account.
+
+    _sheets_client: gspread.Client | None = None
+    _docs_service = None
+    _gmail_service = None
+
+Module-level variables (global state). The | None syntax means the variable
+holds either a valid client object or None. These are initialized to None and
+lazily populated the first time each service is needed — a singleton pattern.
+In C terms, think of these as static pointers initialized to NULL.
+
+────────────────────────────────────────────────────────────────────────────────
+AUTHENTICATION HELPERS
+────────────────────────────────────────────────────────────────────────────────
+
+def _get_creds() -> Credentials:
+    ─────────────────────────────
+    Used by: Sheets tools, Docs tools.
+
+        creds_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH", "service_account.json")
+
+    os.getenv reads an environment variable. The second argument is the
+    default value if the variable is not set — equivalent to:
+        char *path = getenv("GOOGLE_SERVICE_ACCOUNT_PATH");
+        if (!path) path = "service_account.json";
+
+        return Credentials.from_service_account_file(creds_path, scopes=_SA_SCOPES)
+
+    Reads the JSON key file and returns a Credentials object pre-scoped to
+    Sheets and Docs. Google's library handles signing requests with the
+    private key inside that file.
+
+
+def _get_gmail_creds() -> OAuthCredentials:
+    ──────────────────────────────────────────
+    Used by: all Gmail tools. More complex than _get_creds because it handles
+    the full OAuth2 token lifecycle.
+
+        token_path = os.getenv("GMAIL_TOKEN_PATH", "gmail_token.json")
+        client_secrets_path = os.getenv("GMAIL_CLIENT_SECRETS_PATH", "gmail_credentials.json")
+
+    Two file paths: the saved token (reused across runs) and the OAuth2 client
+    secrets downloaded from Google Cloud Console.
+
+        creds = None
+        if os.path.exists(token_path):
+            creds = OAuthCredentials.from_authorized_user_file(token_path, _GMAIL_SCOPES)
+
+    If a token file already exists from a previous authorization, load it.
+    This avoids opening the browser on every run.
+
+        if not creds or not creds.valid:
+
+    "not creds" is True when creds is None (first run, no token file).
+    "not creds.valid" is True when the access token has expired (they last
+    ~1 hour by default).
+
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+
+    If we have a token but it's expired, use the refresh_token to silently
+    get a new access token from Google. No browser interaction needed. This
+    is the standard OAuth2 token refresh flow.
+
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(client_secrets_path, _GMAIL_SCOPES)
+                creds = flow.run_local_server(port=0)
+
+    First run: start the browser-based OAuth2 flow. run_local_server(port=0)
+    spins up a temporary local HTTP server on an OS-assigned port, opens the
+    browser to Google's auth page, and waits for the redirect callback
+    containing the authorization code. port=0 means the OS picks a free port.
+
+            with open(token_path, "w") as f:
+                f.write(creds.to_json())
+
+    Save the new credentials to disk so the next run skips the browser flow.
+    "with open(...) as f:" is Python's RAII-style file handling — the file is
+    guaranteed to be closed when the block exits, even if an exception occurs.
+    Equivalent to fopen/fwrite/fclose but safe.
+
+        return creds
+
+
+def _get_gmail_service():
+def _get_client() -> gspread.Client:
+def _get_docs_service():
+    ─────────────────────────────────
+    All three follow the same singleton pattern:
+
+        global _gmail_service          # declare intent to write the module-level var
+        if _gmail_service is None:     # not yet initialized
+            _gmail_service = build("gmail", "v1", credentials=_get_gmail_creds())
+        return _gmail_service
+
+    "global" in Python is needed only when you want to *assign* to a
+    module-level variable inside a function. Without it, the assignment would
+    create a new local variable and shadow the global — a common Python gotcha.
+
+    build("gmail", "v1", ...) calls Google's API discovery service, downloads
+    the schema for Gmail API v1, and returns a Python object whose methods
+    mirror the API's URL structure. For example:
+        svc.users().messages().list(...)
+    maps to:
+        GET https://gmail.googleapis.com/gmail/v1/users/{userId}/messages
+
+
+def _get_sheet(spreadsheet_id: str, sheet_name: str) -> gspread.Worksheet:
+    ──────────────────────────────────────────────────────────────────────────
+        return _get_client().open_by_key(spreadsheet_id).worksheet(sheet_name)
+
+    A one-liner convenience: get the authenticated Sheets client, open a
+    spreadsheet by its ID (the long string in the Google Sheets URL), then
+    return a specific worksheet tab by name. This is method chaining — each
+    method returns an object and the next method is called on that object,
+    similar to fluent interfaces in C++ builder patterns.
+
+────────────────────────────────────────────────────────────────────────────────
+TIME TOOL
+────────────────────────────────────────────────────────────────────────────────
+
+@tool
+def get_current_time() -> str:
+    ──────────────────────────
+    Returns the current date and time in multiple formats as a JSON string.
+
+        now_utc = datetime.now(timezone.utc)
+        now_local = datetime.now()
+
+    datetime.now(timezone.utc) creates a timezone-aware timestamp for UTC.
+    datetime.now() without arguments returns a naive (no timezone) local
+    timestamp. Keeping both lets callers display local time while also
+    having a canonical UTC reference.
+
+        return json.dumps({
+            "utc": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "local_date": now_local.strftime("%Y-%m-%d"),
+            "local_datetime": now_local.strftime("%Y-%m-%d %H:%M:%S"),
+            "day_of_week": now_local.strftime("%A"),
+        })
+
+    strftime is Python's equivalent of C's strftime — it formats a datetime
+    object into a string according to a format code. The result is serialized
+    to JSON so the agent can reliably parse it into structured fields.
+
+    This tool exists because LLMs have no internal clock — they cannot know
+    "today's date" without calling something that reads the system clock.
+    Agents that track application deadlines, calculate "3 days from now", or
+    log entries with timestamps must call this first.
+
+    Wired to: app_tracker (via main.py). The orchestrator also has access.
+
+────────────────────────────────────────────────────────────────────────────────
+GOOGLE SHEETS TOOLS
+────────────────────────────────────────────────────────────────────────────────
+
+@tool
+def google_sheets_read(spreadsheet_id: str, sheet_name: str) -> str:
+    ──────────────────────────────────────────────────────────────────
+    Reads every row from a worksheet and returns them as a string.
+
+        records = _get_sheet(spreadsheet_id, sheet_name).get_all_records()
+
+    get_all_records() reads the sheet and returns a Python list of dicts,
+    using the first row as keys. Each dict is one data row:
+        [{"title": "SWE", "company": "Acme", ...}, {...}, ...]
+
+        return str(records)
+
+    str() converts the list of dicts to a Python repr string. Not ideal JSON
+    but sufficient for the agent to read. The agent sees all rows as text.
+
+
+@tool
+def google_sheets_append(spreadsheet_id: str, sheet_name: str, row: list) -> str:
+    ──────────────────────────────────────────────────────────────────────────────
+    Adds one new row at the bottom of the sheet.
+
+        _get_sheet(...).append_row(row, value_input_option="USER_ENTERED")
+
+    row is a Python list of values, one per column: ["val_A", "val_B", ...].
+    value_input_option="USER_ENTERED" tells the Sheets API to interpret the
+    values the same way a user would type them — so dates stay dates and
+    numbers stay numbers rather than being treated as raw strings.
+
+
+@tool
+def google_sheets_update_cell(spreadsheet_id, sheet_name, row_index, col_index, value):
+    ────────────────────────────────────────────────────────────────────────────────────
+    Updates a single cell by row/column index (both 1-based, like spreadsheet
+    notation rather than 0-based C arrays).
+
+        _get_sheet(...).update_cell(row_index, col_index, value)
+
+    Simple pass-through to gspread's update_cell. Internally this issues a
+    PATCH request to the Sheets API for just that one cell.
+
+
+@tool
+def google_sheets_find_row(spreadsheet_id: str, sheet_name: str, query: str) -> str:
+    ─────────────────────────────────────────────────────────────────────────────────
+    Searches every cell in the sheet for a string and returns the first match.
+
+        cell = sheet.find(query)
+
+    Returns a Cell object with .row and .col attributes, or None if not found.
+
+        if cell is None:
+            return f"No row found containing '{query}'."
+
+    f"..." is an f-string — Python's string interpolation. Equivalent to
+    snprintf(buf, sizeof(buf), "No row found containing '%s'.", query) in C.
+
+        row_values = sheet.row_values(cell.row)
+        return str({"row_index": cell.row, "values": row_values})
+
+    Fetches all values in that row, packages them with the row index into a
+    dict, and returns it as a string. The agent can parse this to know exactly
+    which row matched and what data it holds.
+
+────────────────────────────────────────────────────────────────────────────────
+GOOGLE DOCS HELPERS
+────────────────────────────────────────────────────────────────────────────────
+
+def _extract_doc_text(doc: dict) -> str:
+    ────────────────────────────────────
+    The Google Docs API returns a document as a deeply nested JSON structure,
+    not as a flat string. This function flattens it into plain text.
+
+        chunks = []
+
+    chunks is a list used as a dynamic array (like a resizable char buffer).
+    Appending to a list is O(1) amortized; joining at the end is one
+    allocation. This pattern is idiomatic Python — building strings by joining
+    a list is faster than repeated string concatenation (unlike C where you
+    might realloc a buffer).
+
+        for element in doc.get("body", {}).get("content", []):
+
+    doc.get("body", {}) safely retrieves the "body" key from the dict,
+    defaulting to an empty dict {} if absent (avoiding a KeyError, Python's
+    equivalent of dereferencing a NULL pointer). Chaining .get("content", [])
+    retrieves the list of structural elements, defaulting to empty list.
+
+            paragraph = element.get("paragraph")
+            if not paragraph:
+                continue
+
+    Docs content includes both paragraphs and structural elements like section
+    breaks. Skip anything that isn't a paragraph.
+
+            for pe in paragraph.get("elements", []):
+                text = pe.get("textRun", {}).get("content", "")
+                chunks.append(text)
+
+    Each paragraph has "elements"; each element may have a "textRun" which
+    contains the actual text string. This handles bold, italic, and other
+    inline formatting by just extracting the text content and discarding style.
+
+        return "".join(chunks)
+
+    "".join(chunks) concatenates all strings in the list with no separator.
+    More efficient than += in a loop because it does a single allocation.
+
+
+def _extract_doc_text used by:
+    google_docs_read — reads the document JSON and passes it here.
+
+────────────────────────────────────────────────────────────────────────────────
+GOOGLE DOCS TOOLS
+────────────────────────────────────────────────────────────────────────────────
+
+@tool
+def google_docs_create(title: str) -> str:
+    ─────────────────────────────────────
+    Creates a brand-new Google Doc with the given title and returns its ID and
+    URL as a JSON string.
+
+        doc = _get_docs_service().documents().create(body={"title": title}).execute()
+        doc_id = doc["documentId"]
+
+    The Docs API create endpoint accepts a minimal body with just a "title"
+    key. The response contains the newly created document's metadata,
+    including its "documentId" — the unique string that appears in the
+    document's URL.
+
+        return json.dumps({
+            "document_id": doc_id,
+            "doc_url": f"https://docs.google.com/document/d/{doc_id}/edit",
+        })
+
+    The URL is constructed by interpolating the doc_id into the standard
+    Google Docs URL pattern. Returning the URL alongside the ID lets the
+    agent share a clickable link with the user and also pass the doc_id to
+    subsequent google_docs_append or google_docs_replace_text calls.
+
+    Typical usage: the scorer_analyst, report_writer, or interview_coach
+    calls google_docs_create to provision a fresh document, then uses
+    google_docs_append to fill it with content. This separates "create"
+    from "write" so the agent can confirm the doc exists before writing.
+
+    Wired to: scorer_analyst, report_writer, interview_coach (via main.py).
+
+
+@tool
+def google_docs_read(document_id: str) -> str:
+    ──────────────────────────────────────────
+    Fetches and returns the full plain-text content of a Google Doc.
+
+        doc = _get_docs_service().documents().get(documentId=document_id).execute()
+
+    .execute() is the pattern used by Google's Python client to actually send
+    the HTTP request and return the response. Until .execute() is called, the
+    call is just building a request object — nothing goes over the network.
+    The result is a Python dict representing the full document JSON.
+
+        return _extract_doc_text(doc)
+
+    Pass the JSON to the helper above to get a flat string back.
+
+
+@tool
+def google_docs_append(document_id: str, text: str) -> str:
+    ───────────────────────────────────────────────────────
+    Inserts text at the end of a document.
+
+        doc = _get_docs_service().documents().get(documentId=document_id).execute()
+        end_index = doc["body"]["content"][-1]["endIndex"] - 1
+
+    The Docs API uses character indices to position insertions. Every character
+    in the document has an index. doc["body"]["content"] is a list; [-1]
+    accesses the last element (Python negative indexing, equivalent to
+    arr[len-1] in C). That last element's "endIndex" is one past the final
+    character — we subtract 1 to insert just before the document-end marker.
+
+        requests = [{"insertText": {"location": {"index": end_index}, "text": text}}]
+
+    The Docs batchUpdate API takes a list of "request" objects. Here there is
+    one request: insert text at a specific index. This is the API's way of
+    describing mutations — declarative rather than imperative.
+
+        _get_docs_service().documents().batchUpdate(
+            documentId=document_id, body={"requests": requests}
+        ).execute()
+
+    Send the mutation to Google. body={"requests": requests} wraps the request
+    list in the envelope structure the API expects.
+
+
+@tool
+def google_docs_replace_text(document_id: str, find: str, replacement: str) -> str:
+    ─────────────────────────────────────────────────────────────────────────────────
+    Find-and-replace all occurrences of a string throughout the document.
+
+        requests = [{"replaceAllText": {
+            "containsText": {"text": find, "matchCase": True},
+            "replaceText": replacement,
+        }}]
+
+    Another batchUpdate request, this time using replaceAllText. matchCase:True
+    means the search is case-sensitive.
+
+        count = (
+            result.get("replies", [{}])[0]
+            .get("replaceAllText", {})
+            .get("occurrencesChanged", 0)
+        )
+
+    The API response echoes back each request's result in a "replies" list.
+    [{}] is the default (a list with one empty dict) so [0] is safe even if
+    replies is missing. Chains of .get() safely traverse the nested response
+    to extract how many replacements were made.
+
+────────────────────────────────────────────────────────────────────────────────
+GMAIL HELPERS
+────────────────────────────────────────────────────────────────────────────────
+
+def _decode_message_body(payload: dict) -> str:
+    ───────────────────────────────────────────
+    Recursively extracts the plain-text body from a Gmail message. Gmail
+    messages are structured as MIME trees — a message can be multipart
+    (text/plain + text/html + attachments), and each part can itself be
+    multipart. This function walks the tree.
+
+        mime_type = payload.get("mimeType", "")
+        if mime_type == "text/plain":
+            data = payload.get("body", {}).get("data", "")
+            return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+
+    When we find a text/plain part, its content is base64url-encoded (a
+    variant of Base64 that uses - and _ instead of + and / so it's safe in
+    URLs). We decode it to bytes, then decode the bytes to a UTF-8 string.
+    The "==" padding is appended because Python's base64 decoder requires
+    padding but Gmail sometimes omits it. errors="replace" substitutes
+    the Unicode replacement character for any bytes that aren't valid UTF-8,
+    preventing crashes on malformed encodings.
+
+        for part in payload.get("parts", []):
+            text = _decode_message_body(part)
+            if text:
+                return text
+
+    Recursion: if this payload is multipart, iterate its "parts" and
+    recurse into each. Return the first non-empty text/plain body found.
+    This is a depth-first tree search — same concept as walking a linked list
+    of structs in C, but the "next pointer" is a list named "parts".
+
+
+def _get_header(headers: list[dict], name: str) -> str:
+    ─────────────────────────────────────────────────────
+    Linear scan through the list of header dicts to find one by name.
+
+        for h in headers:
+            if h["name"].lower() == name.lower():
+                return h["value"]
+        return ""
+
+    Each header is a dict like {"name": "Subject", "value": "Job offer"}.
+    .lower() normalizes both sides to lowercase for case-insensitive matching.
+    Returns empty string if not found, so callers never get None back.
+
+────────────────────────────────────────────────────────────────────────────────
+GMAIL TOOLS
+────────────────────────────────────────────────────────────────────────────────
+
+@tool
+def gmail_read(query: str = "", max_results: int = 10) -> str:
+    ─────────────────────────────────────────────────────────
+    Searches Gmail and returns matching messages as a JSON string.
+
+        result = svc.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
+
+    userId="me" means the authenticated user's own mailbox. q=query passes
+    a Gmail search string (same syntax as the Gmail search bar, e.g.
+    "from:boss@company.com is:unread"). This returns only message IDs and
+    thread IDs — not full message content.
+
+        messages = result.get("messages", [])
+        if not messages:
+            return json.dumps([])
+
+    json.dumps([]) returns the string "[]" — an empty JSON array. The agent
+    can parse this consistently regardless of whether results were found.
+
+        for msg_ref in messages:
+            msg = svc.users().messages().get(userId="me", id=msg_ref["id"], format="full").execute()
+
+    The list endpoint returns stubs. A second API call per message fetches the
+    full content. format="full" returns headers + body (as opposed to "metadata"
+    which returns headers only, or "raw" which returns RFC 2822 bytes).
+
+        output.append({
+            "id": msg["id"],
+            "subject": _get_header(headers, "Subject"),
+            ...
+            "body": _decode_message_body(msg.get("payload", {})),
+        })
+
+    Assembles a clean dict for each message, discarding the dozens of internal
+    Gmail fields the API returns (labelIds, historyId, internalDate, sizeEstimate,
+    threadId, etc.) that the agent doesn't need.
+
+        return json.dumps(output, indent=2)
+
+    Returns the list as pretty-printed JSON (indent=2 adds 2-space indentation).
+
+
+@tool
+def gmail_create_draft(to: str, subject: str, body: str) -> str:
+    ──────────────────────────────────────────────────────────────
+    Creates a draft in the user's Gmail Drafts folder without sending it.
+
+        mime = MIMEText(body)
+        mime["to"] = to
+        mime["subject"] = subject
+
+    MIMEText constructs a standards-compliant email message object. Assigning
+    to mime["to"] sets the "To:" header. The body passed to MIMEText() becomes
+    the message body with Content-Type: text/plain.
+
+        raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+
+    mime.as_bytes() serializes the entire MIME message (headers + body) to a
+    byte string. base64.urlsafe_b64encode() encodes those bytes to a base64url
+    ASCII string. .decode() converts the resulting bytes object to a Python str
+    (Python distinguishes between bytes and str; this converts between them).
+    Gmail's API requires this encoding for the "raw" field.
+
+        draft = svc.users().drafts().create(userId="me", body={"message": {"raw": raw}}).execute()
+        return f"Draft created with id: {draft['id']}"
+
+    Posts the encoded message to the Drafts API. The response contains the
+    new draft's ID, which is returned so the caller can reference it later.
+
+
+@tool
+def gmail_send(to: str, subject: str, body: str) -> str:
+    ────────────────────────────────────────────────────
+    Sends an email immediately. Nearly identical to gmail_create_draft.
+
+    The only difference is the API endpoint:
+        svc.users().messages().send(...)   ← actually sends
+        svc.users().drafts().create(...)   ← saves to Drafts
+
+    The MIME construction and base64 encoding are identical.
+
+────────────────────────────────────────────────────────────────────────────────
+JSEARCH HELPERS
+────────────────────────────────────────────────────────────────────────────────
+
+def _jsearch_headers() -> dict:
+    ────────────────────────────
+    Builds the HTTP header required by the JSearch API and returns it as a
+    plain dict.
+
+        api_key = os.getenv("JSEARCH_API_KEY", "")
+        return {"x-api-key": api_key}
+
+    x-api-key — your personal API key, read from the environment so it is
+    never hard-coded in source. os.getenv returns "" (empty string) if the
+    variable is not set; the API will then respond with 401/403, making the
+    missing key obvious.
+
+    Keeping this in one helper means jsearch_request always sends the correct
+    auth header with no duplication.
+
+
+_JSEARCH_BASE = "https://api.openwebninja.com/jsearch"
+    ──────────────────────────────────────────────────
+    A module-level string constant holding the base URL. jsearch_request
+    appends the endpoint path to this. Centralising the URL means you only
+    need to change it in one place if the host ever changes.
+
+
+def _summarize_job_descriptions(data: dict) -> dict:
+    ────────────────────────────────────────────────
+    Replaces full job descriptions in a JSearch search response with concise
+    50-100 word summaries, then returns the modified data dict.
+
+        jobs = data.get("data", [])
+        if not jobs:
+            return data
+
+    Safely extracts the "data" list from the JSearch response envelope.
+    Early-returns unchanged if the list is empty.
+
+        descriptions = [job.get("job_description", "") for job in jobs]
+
+    List comprehension: builds a list of raw description strings in the same
+    order as the jobs list. Equivalent to a for-loop that appends to a buffer.
+
+        prompt = (
+            "Summarize each job description below in 50-100 words. "
+            "Return only a JSON array of strings ..."
+            + "\n\n---\n\n".join(f"Job {i + 1}:\n{d}" for i, d in enumerate(descriptions))
+        )
+
+    Constructs a single prompt that packs all descriptions in one LLM call
+    rather than calling the LLM once per job. enumerate() yields (index, value)
+    pairs — like a for-loop with both a counter and the value, equivalent to
+    a C for(int i=0; i<n; i++) that also accesses arr[i].
+
+        llm = ChatOpenAI(model="gpt-4.1-nano")
+        response = llm.invoke([HumanMessage(content=prompt)])
+        summaries = json.loads(response.content)
+
+    Instantiates GPT-4.1-nano (a fast, cheap OpenAI model), calls it, and
+    parses the returned JSON array. If the LLM follows the prompt, summaries
+    is a list of strings parallel to descriptions.
+
+        for job, summary in zip(jobs, summaries):
+            job["job_description"] = summary
+        return data
+
+    zip() pairs each job dict with its summary by position — like iterating
+    two parallel arrays simultaneously in C. Mutates each job in-place and
+    returns the whole data dict with the descriptions replaced.
+
+    Why do this? Full job postings can be thousands of words each. Returning
+    a page of 10 raw postings would overflow the agent's context window.
+    Summaries keep the token count manageable while preserving what the
+    scorer_analyst needs to evaluate fit.
+
+────────────────────────────────────────────────────────────────────────────────
+JSEARCH TOOLS
+────────────────────────────────────────────────────────────────────────────────
+
+@tool
+def jsearch_request(
+    endpoint: Literal["search", "job-details"],
+    query, page, num_pages, date_posted, remote_jobs_only,
+    employment_types, job_requirements, country,
+    job_id, extended_publisher_details,
+) -> str:
+    ──────────────────────────────────────────────────────────────────────────
+    Unified JSearch tool. A single @tool that handles both the /search and
+    /job-details endpoints, selected by the endpoint parameter.
+
+    Using Literal["search", "job-details"] as the type annotation restricts
+    the parameter to exactly those two string values — equivalent to a C enum.
+    The LLM sees this in the tool schema and knows to pass only one of those
+    two strings.
+
+    SEARCH branch (endpoint == "search"):
+
+        params: dict = {
+            "query": query,
+            "page": page,
+            "num_pages": num_pages,
+            "date_posted": date_posted,
+            "remote_jobs_only": str(remote_jobs_only).lower(),
+            "country": country,
+        }
+        if employment_types:
+            params["employment_types"] = employment_types
+        if job_requirements:
+            params["job_requirements"] = job_requirements
+
+    All search parameters are assembled into a plain dict. httpx encodes it
+    as a URL query string: ?query=hardware+engineer&page=1&...
+    Optional parameters are only added when truthy — sending
+    "employment_types=None" would confuse the API.
+
+        data = _summarize_job_descriptions(response.json())
+        return json.dumps(data, indent=2)
+
+    After fetching, job descriptions are replaced by 50-100 word summaries
+    (see _summarize_job_descriptions above) before returning to the agent.
+
+    JOB-DETAILS branch (endpoint == "job-details"):
+
+        params = {
+            "job_id": job_id,
+            "extended_publisher_details": str(extended_publisher_details).lower(),
+        }
+
+    The API expects "true" or "false" as strings, not Python booleans. str()
+    converts True → "True"; .lower() produces "true". This branch returns the
+    full job record without summarization — full details are needed by the
+    scorer_analyst or interview_coach.
+
+    Typical usage sequence:
+        1. Call jsearch_request(endpoint="search", ...) → get a list of jobs
+           with job_id fields and summarized descriptions.
+        2. Pick one or more job_ids.
+        3. Call jsearch_request(endpoint="job-details", job_id=...) for each
+           → get the full description needed to evaluate the role deeply.
+
+    Why merge two tools into one? The agent's tool list is shorter and cleaner.
+    The LLM doesn't need to reason about which of two similarly-named tools to
+    call — it just picks the endpoint parameter. The auth headers and base URL
+    logic are shared naturally.
+
+================================================================================
+SUMMARY: KEY PYTHON PATTERNS FOR A C PROGRAMMER
+================================================================================
+
+  | Python concept              | C / C++ analogue                          |
+  |-----------------------------|-------------------------------------------|
+  | dict                        | struct or hash map                        |
+  | list                        | dynamic array (realloc-based)             |
+  | dict.get(key, default)      | val = map[key] ?? default (safe lookup)   |
+  | f"text {var}"               | snprintf(buf, size, "text %s", var)       |
+  | with open(...) as f:        | fopen + guaranteed fclose via destructor  |
+  | global var_name             | explicit intent to write a static global  |
+  | @decorator                  | function wrapping / preprocessor macro    |
+  | None                        | NULL                                      |
+  | not x                       | !x or x == NULL                           |
+  | isinstance(x, dict)         | runtime type check (no direct C equiv)    |
+  | list[-1]                    | arr[len - 1]                              |
+  | "".join(list_of_strings)    | strcat loop but efficient (one alloc)     |
+  | x | None (type annotation)  | T *x; /* nullable */ (documentation only) |
+
+================================================================================
