@@ -192,7 +192,7 @@ def run_gmail_trigger(query: str = "is:unread subject:[career]", poll_interval: 
     print(f"Gmail trigger active. Polling every {poll_interval}s for: {query!r}")
     while True:
         try:
-            emails = json.loads(gmail_read(query=query, max_results=10, full_body=True))
+            emails = json.loads(gmail_read.invoke({"query": query, "max_results": 10, "full_body": True}))
             for email in emails:
                 email_id = email["id"]
                 if email_id in processed_ids:

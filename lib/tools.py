@@ -55,11 +55,21 @@ _tavily_client: TavilyClient | None = None
 
 
 def _get_creds() -> Credentials:
+    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if sa_json:
+        return Credentials.from_service_account_info(json.loads(sa_json), scopes=_SA_SCOPES)
     creds_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH", "service_account.json")
     return Credentials.from_service_account_file(creds_path, scopes=_SA_SCOPES)
 
 
 def _get_gmail_creds() -> OAuthCredentials:
+    token_json = os.environ.get("GMAIL_TOKEN_JSON")
+    if token_json:
+        creds = OAuthCredentials.from_authorized_user_info(json.loads(token_json), _GMAIL_SCOPES)
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        return creds
+    # local dev fallback: file-based OAuth flow
     token_path = os.getenv("GMAIL_TOKEN_PATH", "gmail_token.json")
     client_secrets_path = os.getenv("GMAIL_CLIENT_SECRETS_PATH", "gmail_credentials.json")
     creds = None
