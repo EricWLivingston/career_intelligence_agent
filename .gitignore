@@ -23,6 +23,8 @@ gmail_token.json
 # Generated / temporary outputs
 tmp/
 state.db
+state.db-shm
+state.db-wal
 
 # Local Claude Code settings
 .claude/

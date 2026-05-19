@@ -107,8 +107,9 @@ uv run python main.py --thread new-topic     # fresh named session
 - **Phase 1 complete** — credential functions support env var injection. Manual step remaining: add `GOOGLE_SERVICE_ACCOUNT_JSON` and `GMAIL_TOKEN_JSON` to `.env` (paste JSON file contents) and test with files renamed/removed.
 - **Phase 2 complete** — SQLite checkpointer active. `state.db` is created automatically on first run.
 - **Chat persistence working** — `chat-main` thread ID is consistent across restarts.
-- **Phase 3 complete** — FastAPI server live at `api/server.py`. Start with `APP_API_KEY=<secret> uvicorn api.server:app --reload`. `POST /chat` (SSE, requires `X-Api-Key` header) and `GET /health` are implemented.
-- **Next production step:** PRODUCTION_PLAN.md Phase 4 — frontend (Chainlit recommended for fastest path) or Phase 5 — deploy to Railway.
+- **Phase 3 complete** — FastAPI server live at `api/server.py`. Start with `uv run uvicorn api.server:app --reload`. `POST /chat` (SSE, requires `X-Api-Key` header) and `GET /health` are implemented.
+- **Phase 4 complete** — Streamlit frontend live at `streamlit_app.py`. Start with `uv run streamlit run streamlit_app.py`. Opens at `http://localhost:8501`. Each browser session gets its own `web-{uuid}` thread ID; SQLite persists agent memory within a session.
+- **Next production step:** PRODUCTION_PLAN.md Phase 5 — deploy to Railway (backend) + Streamlit Community Cloud (frontend, free).
 
 ---
 
@@ -123,6 +124,7 @@ uv run python main.py --thread new-topic     # fresh named session
 | `skills/triggers/SKILL.md` | Gmail and schedule trigger handling |
 | `skills/critic/SKILL.md` | Critic agent integration protocol |
 | `skills/delegation/SKILL.md` | Legacy — content inlined into orchestrator prompt; no longer loaded at runtime |
+| `streamlit_app.py` | Streamlit chat UI — imports `run_agent` directly, session-scoped thread IDs |
 | `api/server.py` | FastAPI app — `POST /chat` (SSE) and `GET /health` |
 | `api/auth.py` | `verify_key` dependency — checks `X-Api-Key` header against `APP_API_KEY` env var |
 | `api/models.py` | `ChatRequest` Pydantic model (`message`, `thread_id`) |
