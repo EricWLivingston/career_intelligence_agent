@@ -19,6 +19,7 @@ gmail_token.json
 
 # Jupyter
 .ipynb_checkpoints/
+dev.ipynb
 
 # Generated / temporary outputs
 tmp/
@@ -26,8 +27,12 @@ state.db
 state.db-shm
 state.db-wal
 
+# Info / documentation folder
+info/
+
 # Local Claude Code settings
 .claude/
 
 # macOS
 .DS_Store
+

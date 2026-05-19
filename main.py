@@ -112,7 +112,7 @@ def build_agents():
         subagents=SUBAGENTS,
         backend=FilesystemBackend(root_dir=".", virtual_mode=True),
         skills=["./skills/"],
-        checkpointer=SqliteSaver(sqlite3.connect("./state.db", check_same_thread=False)),
+        checkpointer=SqliteSaver(sqlite3.connect("./state/state.db", check_same_thread=False)),
     )
 
 
