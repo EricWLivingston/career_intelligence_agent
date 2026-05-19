@@ -36,94 +36,79 @@ Tool consistency check (run to verify): `uv run python -c "from langchain_core.t
 
 ## Changes Made Across All Sessions
 
-### Bug Fix — JSONDecodeError in `jsearch_request` (`lib/tools.py`)
-`_summarize_job_descriptions` called `json.loads()` on LLM output that sometimes came back wrapped in markdown code fences (` ```json ... ``` `). Fixed by stripping fences with a regex before parsing, with fallback to keep original descriptions if parsing still fails.
+### Prior sessions (see git history for full detail)
+- All core bug fixes: JSONDecodeError in jsearch, research agents using grep instead of web_search, hardcoded 2024 year, missing tools restored, google_sheets_column dedup key, critic_agent missing web_search, dev.ipynb sync, app_tracker → job_cataloguer rename, job_cataloguer batch logging fix.
+- All optimizations from OPTIMIZATION_REVIEW.md: compact JSON, prompt caching, LangSmith tracing, skill spec compliance, gmail_read full_body param, google_docs_write skip prefetch.
+- main.py restructured with `get_agent()` singleton, `_extract_response()`, `run_agent()`, `run_chat()`, `run_gmail_trigger()`, argparse CLI.
 
-### Bug Fix — Research agents using grep/glob instead of `web_search` (`lib/prompts.py`)
-Deep Agents' `FilesystemMiddleware` injects `grep`, `glob`, and `read_file` tools into every subagent. Research agents (`scorer_analyst`, `report_writer`, `interview_coach`, `critic_agent`) were using these filesystem tools to look for web search capability rather than calling `web_search` directly. Fixed by prepending a two-sentence explicit warning to each agent's `<tools>` block: "Call all tools listed here directly by name — they are registered and ready. Filesystem tools (grep, glob, read_file) are present for internal state only; never use them for internet or web research."
+---
 
-### Bug Fix — Hardcoded year in search queries (`lib/prompts.py`)
-All time-sensitive search query examples in `scorer_analyst`, `report_writer`, `interview_coach`, and `critic_agent` prompts used the hardcoded year "2024". Replaced with `{current_year}` — each agent receives the current date from the orchestrator and uses it to construct fresh queries.
+### This session
 
-### Restored missing tools to `lib/tools.py`
-`web_search`, `google_sheets_column`, and `google_docs_write` were absent from the file (external modification). All three restored:
-- `web_search`: Tavily singleton (`_get_tavily()`), returns JSON array of `{title, url, content}`
-- `google_sheets_column`: fetches a single column by header name, returns flat JSON array
-- `google_docs_write`: deletes all existing doc content then inserts new text via batchUpdate
+#### Git setup and first commit
+- Added `.ipynb_checkpoints/`, `tmp/`, `.claude/`, and `state.db` to `.gitignore`
+- Resolved GitHub push rejection (`git pull origin main --allow-unrelated-histories`) caused by GitHub auto-generating an initial file on repo creation
+- First commit pushed to GitHub successfully
 
-### Bug Fix — `google_sheets_column` dedup key (`lib/prompts.py`, `dev.ipynb`)
-`job_researcher` prompt was instructing `google_sheets_column` to use `column="job_apply_link"`. Changed to `column="job_id"` — the apply link is not a stable unique key; `job_id` is the canonical dedup identifier from JSearch. Also fixed in `dev.ipynb` cell 10.
+#### Created `MAIN_EXPLANATION.md`
+Comprehensive code walkthrough of `main.py` — covers every section: imports, `_cached()`, `SUBAGENTS` roster, model selection rationale, `build_agents()`, singleton pattern, response parsing, both trigger modes, and CLI usage.
 
-### Bug Fix — `critic_agent` missing `web_search` tool (`main.py`, `lib/prompts.py`)
-`critic_agent` prompt described `web_search` as a tool but it was not in the agent's tool list in `main.py`. Added `web_search` to the critic's tool list so it can independently spot-check facts in audited outputs.
+#### Bug fix — Gmail trigger `StructuredTool` not callable (`main.py`)
+`gmail_read(query=..., ...)` failed with `'StructuredTool' object is not callable`. LangChain's `@tool` decorator wraps functions into `StructuredTool` objects that require `.invoke({...})` for direct calls outside an agent.
 
-### `dev.ipynb` synced with `main.py`
-Notebook was out of sync in several ways — all fixed:
-- Cell 2: removed local `_cached` definition, added `from main import _cached, SUBAGENTS, build_agents`
-- Cell 4: removed local SUBAGENTS redefinition; `build_subagent()` now reads from the imported `SUBAGENTS` list
-- Cell 10: `column="job_apply_link"` → `column="job_id"`
-- Cells 30, 31: queries updated from "2024" → "2026"
-- Cell 33: `build_orchestrator()` → `build_agents()`
+```python
+# before
+gmail_read(query=query, max_results=10, full_body=True)
 
-### Rename `app_tracker` → `job_cataloguer` (all files)
-The subagent was named `app_tracker`, which the orchestrator didn't associate with logging or cataloguing requests ("log this job", "add to my list"). Renamed to `job_cataloguer` across every file. Additionally expanded the ORCHESTRATOR_PROMPT intent routing from 2 patterns to 6:
-- "Log [job/role]" → job_cataloguer
-- "Add this to my list / catalogue" → job_cataloguer
-- "Save this job / role" → job_cataloguer
-- "Mark [role] as applied / shortlisted / rejected" → job_cataloguer
-- "What's my pipeline?" → job_cataloguer
-- "Any follow-ups due?" → job_cataloguer
+# after
+gmail_read.invoke({"query": query, "max_results": 10, "full_body": True})
+```
 
-Files touched: `lib/prompts.py` (variable rename `APP_TRACKER_PROMPT` → `JOB_CATALOGUER_PROMPT`, ORCHESTRATOR_PROMPT sub-agents list, intent routing, delegation section, role description in the prompt itself), `main.py` (import, subagent name/description/system_prompt), `dev.ipynb` (cells 2, 44, 45, 49), `skills/triggers/SKILL.md`, `skills/delegation/SKILL.md`, `skills/output_format/SKILL.md`.
+#### Phase 1 — Decouple secrets from filesystem (`lib/tools.py`)
+Both credential functions now check for an environment variable first and fall back to file-based auth for local dev:
 
-### Bug Fix — `job_cataloguer` only logging 3 of 5 jobs (`lib/tools.py`, `main.py`, `lib/prompts.py`)
-Root cause: `google_sheets_append` takes one row at a time, requiring N sequential tool calls to log N jobs. Claude Haiku stops making repetitive tool calls early (~3), and the `log_new` prompt description said "Write new row" (singular) with no loop instruction. Fixed three ways:
-- Added `google_sheets_append_batch` tool to `lib/tools.py` using gspread's `append_rows` — writes all N rows in a single API call
-- Added `google_sheets_append_batch` to job_cataloguer's tool list in `main.py`
-- Updated `log_new` in `JOB_CATALOGUER_PROMPT` to: collect ALL jobs into a row list, call `google_sheets_append_batch` ONCE, never loop on `google_sheets_append`
-- Added `google_sheets_append_batch` to the `<tools>` block in `JOB_CATALOGUER_PROMPT` so Haiku sees it before reading the action description
+- **`_get_creds()`**: reads `GOOGLE_SERVICE_ACCOUNT_JSON` env var (full JSON string) → `Credentials.from_service_account_info()`. Falls back to `service_account.json` file.
+- **`_get_gmail_creds()`**: reads `GMAIL_TOKEN_JSON` env var → `OAuthCredentials.from_authorized_user_info()`, auto-refreshes if expired. Falls back to file-based OAuth flow (opens browser — local only).
 
-### Optimizations applied (from OPTIMIZATION_REVIEW.md)
-All prior sessions:
-- **Compact JSON** — `jsearch_request` uses `separators=(',', ':')`. Saves ~2–4K tokens per search call.
-- **`critic_agent` web_search tool** — added to agent's tool list.
-- **`google_sheets_column`** — dedicated single-column tool; job_researcher uses it for dedup instead of full sheet read (100 jobs: ~3KB vs ~50KB).
-- **Delegation skill inlined** — ORCHESTRATOR_PROMPT includes delegation rules directly; eliminates one skill-load round-trip per sub-agent call.
-- **`google_sheets_read` valid JSON** — returns `json.dumps` instead of Python `str(records)`.
-- **Prompt caching** — `_cached()` helper wraps all system prompts in `cache_control: {"type": "ephemeral"}`.
-- **LangSmith tracing** — `LANGCHAIN_TRACING_V2=true` + `LANGCHAIN_PROJECT=career-intelligence-agent` in `.env`.
-- **Skill spec compliance** — `skills/output_format/SKILL.md` name changed to `output-format`.
+To activate on any server: set `GOOGLE_SERVICE_ACCOUNT_JSON` and `GMAIL_TOKEN_JSON` in the host's environment variables (paste the full JSON contents of each file as a single-quoted string).
 
-This session:
-- **U1 — Removed `google_docs_read` from 3 agents** (`main.py`): scorer_analyst, report_writer, interview_coach had it assigned but never used it in their prompts. Orchestrator summarizes docs before delegation so these agents never need direct doc reads.
-- **U2 — Removed `gmail_create_draft`** (`lib/tools.py`): tool was defined but not assigned to any agent. Removed entirely.
-- **U3 — Added `google_sheets_append_batch` to job_cataloguer `<tools>` block** (`lib/prompts.py`): was in main.py and the action description but missing from the `<tools>` inventory — Haiku needs to see it there to know it's callable.
-- **S1/T1 — `gmail_read` rewrite** (`lib/tools.py`): added `full_body: bool = False` parameter; uses `format="metadata"` by default (faster, smaller payloads); body only included when `full_body=True`; output now compact JSON.
-- **T2 — `jsearch_request` compact JSON** (`lib/tools.py` lines 466, 476): both return paths now use `separators=(',', ':')`.
-- **S5 — `google_docs_write` skip prefetch** (`lib/tools.py`): added `is_new: bool = False` parameter; skips the GET round-trip when writing to a freshly created doc.
-- **T3 — `critic_agent` web_search cap** (`lib/prompts.py`): added "cap total searches at 5 per audited output" alongside the existing "spot-check at least 3 key facts" instruction.
+#### Phase 2 — SQLite persistent checkpointer (`main.py`, `pyproject.toml`)
+Replaced in-RAM `MemorySaver` with `SqliteSaver` so conversation history survives process restarts.
 
-### Production prep — `main.py` restructured
-`main()` was replaced by a proper trigger architecture:
-- **`get_agent()`** — module-level singleton; builds the agent once and caches it. FastAPI/Chainlit import this directly rather than calling `build_agents()` per request.
-- **`_extract_response(result)`** — handles both plain-string and multi-block list content from Claude responses.
-- **`run_agent(message, thread_id)`** — single invocation point shared by all triggers. Future FastAPI server calls this (or `get_agent().astream()` for SSE streaming).
-- **`run_chat()`** — interactive chat trigger with per-session UUID thread IDs (`chat-{8 hex chars}`). Fixes the hardcoded `"career-session-1"` thread ID.
-- **`run_gmail_trigger(query, poll_interval)`** — polls Gmail every N seconds for emails matching `query`. Reads with `full_body=True`. Each email gets its own thread (`gmail-{email_id}`). The `[Gmail trigger]` prefix causes the orchestrator to load the `triggers` skill, which routes sub-agents and calls `gmail_send` to reply. Processed IDs persisted across restarts in `tmp/gmail_processed.json`.
-- **CLI dispatch via `argparse`**:
-  - `uv run python main.py` → chat trigger
-  - `uv run python main.py gmail` → Gmail trigger (default: `is:unread subject:[career]`, 60s interval)
-  - `uv run python main.py gmail --query "is:unread label:career-agent" --interval 120`
+- Added `langgraph-checkpoint-sqlite` to `pyproject.toml`
+- Added `import sqlite3` to `main.py`
+- `build_agents()` now uses:
+  ```python
+  checkpointer=SqliteSaver(sqlite3.connect("./state.db", check_same_thread=False))
+  ```
+- `state.db` added to `.gitignore`
+
+**Note:** `SqliteSaver.from_conn_string()` returns a context manager (`_GeneratorContextManager`), not a `BaseCheckpointSaver` — passing it directly to `create_deep_agent` raises a `TypeError`. Fix is to pass a raw `sqlite3.connect()` call instead.
+
+#### Bug fix — Chat sessions not persisting context between restarts (`main.py`)
+`run_chat()` was generating a new random UUID thread ID on every startup (`chat-{uuid4().hex[:8]}`). SQLite was persisting state correctly but each new session used a different key, so old context was never found.
+
+Fixed by defaulting to a fixed thread ID:
+```python
+def run_chat(thread_id: str = "chat-main") -> None:
+```
+
+Added `--thread` CLI argument so the user can start a named alternate session:
+```bash
+uv run python main.py                        # continues "chat-main" thread
+uv run python main.py --thread new-topic     # fresh named session
+```
 
 ---
 
 ## Current State
 
-- **No commits have been made** — entire working tree is untracked/unstaged. Stage files explicitly (not `git add .`) to avoid committing credential files outside `.gitignore`.
-- **Tool consistency check: PASS** — 16 tools referenced, 0 missing.
-- **`dev.ipynb` is the primary testing surface.** Run cells top-to-bottom; cells 2 and 4 must execute before any agent or tool test cells. Note: `dev.ipynb` imports `build_agents` from `main` — the new `get_agent()` / `run_agent()` functions are also importable from `main`.
-- **OPTIMIZATION_REVIEW.md outstanding items:** S2 (`ChatOpenAI` singleton + remove GPT dependency in `_summarize_job_descriptions`), S3 (`httpx.Client` singleton in `jsearch_request`), S4 (thread ID now fixed in chat trigger; `MemorySaver` → `SqliteSaver` is next for persistence across restarts — PRODUCTION_PLAN.md Phase 2).
-- **Next production step:** PRODUCTION_PLAN.md Phase 1 — decouple secrets from filesystem (`GOOGLE_SERVICE_ACCOUNT_JSON` and `GMAIL_TOKEN_JSON` env vars in `lib/tools.py`).
+- **Project is on GitHub** (private repo). All credential files gitignored; `.env` gitignored.
+- **Phase 1 complete** — credential functions support env var injection. Manual step remaining: add `GOOGLE_SERVICE_ACCOUNT_JSON` and `GMAIL_TOKEN_JSON` to `.env` (paste JSON file contents) and test with files renamed/removed.
+- **Phase 2 complete** — SQLite checkpointer active. `state.db` is created automatically on first run.
+- **Chat persistence working** — `chat-main` thread ID is consistent across restarts.
+- **Phase 3 complete** — FastAPI server live at `api/server.py`. Start with `APP_API_KEY=<secret> uvicorn api.server:app --reload`. `POST /chat` (SSE, requires `X-Api-Key` header) and `GET /health` are implemented.
+- **Next production step:** PRODUCTION_PLAN.md Phase 4 — frontend (Chainlit recommended for fastest path) or Phase 5 — deploy to Railway.
 
 ---
 
@@ -132,17 +117,22 @@ This session:
 | File | Purpose |
 |---|---|
 | `main.py` | Agent definitions, trigger functions (`run_chat`, `run_gmail_trigger`), and CLI entry point |
-| `lib/tools.py` | All tool implementations |
+| `lib/tools.py` | All tool implementations, credential management |
 | `lib/prompts.py` | System prompts for each sub-agent |
 | `skills/output_format/SKILL.md` | HTML email/doc formatting rules (name: `output-format`) |
 | `skills/triggers/SKILL.md` | Gmail and schedule trigger handling |
 | `skills/critic/SKILL.md` | Critic agent integration protocol |
 | `skills/delegation/SKILL.md` | Legacy — content inlined into orchestrator prompt; no longer loaded at runtime |
+| `api/server.py` | FastAPI app — `POST /chat` (SSE) and `GET /health` |
+| `api/auth.py` | `verify_key` dependency — checks `X-Api-Key` header against `APP_API_KEY` env var |
+| `api/models.py` | `ChatRequest` Pydantic model (`message`, `thread_id`) |
 | `dev.ipynb` | Interactive testing notebook |
-| `PRODUCTION_PLAN.md` | Full production transition plan |
+| `MAIN_EXPLANATION.md` | Plain-English walkthrough of every section of `main.py` |
+| `PRODUCTION_PLAN.md` | Full production transition plan with phased steps |
 | `OPTIMIZATION_REVIEW.md` | Speed/token optimization findings with current status |
+| `state.db` | SQLite checkpoint database — auto-created, gitignored |
 | `tmp/gmail_processed.json` | Persisted set of processed Gmail message IDs (auto-created by gmail trigger) |
-| `.env` | All API keys + `LANGCHAIN_TRACING_V2=true` + `LANGCHAIN_PROJECT` |
+| `.env` | All API keys + `LANGCHAIN_TRACING_V2=true` + `LANGCHAIN_PROJECT` + `GOOGLE_SERVICE_ACCOUNT_JSON` + `GMAIL_TOKEN_JSON` (once Phase 1 manual step is done) |
 | `service_account.json` | Google service account key — Sheets only (gitignored) |
 | `gmail_credentials.json` | OAuth2 Desktop client secrets — Gmail + Docs (gitignored) |
 | `gmail_token.json` | Saved Gmail+Docs OAuth token, auto-refreshed (gitignored) |
@@ -153,11 +143,23 @@ This session:
 
 | What | Credentials | Reason |
 |---|---|---|
-| Google Sheets | Service account (`service_account.json`) | Sheets shared with SA; no file creation needed |
-| Google Docs | OAuth user (`gmail_token.json`) | Must create files in user's Drive; SA has no Drive on personal accounts |
-| Gmail | OAuth user (`gmail_token.json`) | Must act as the user to send/read their email |
+| Google Sheets | Service account (`service_account.json` or `GOOGLE_SERVICE_ACCOUNT_JSON` env var) | Sheets shared with SA; no file creation needed |
+| Google Docs | OAuth user (`gmail_token.json` or `GMAIL_TOKEN_JSON` env var) | Must create files in user's Drive; SA has no Drive on personal accounts |
+| Gmail | OAuth user (`gmail_token.json` or `GMAIL_TOKEN_JSON` env var) | Must act as the user to send/read their email |
 | JSearch API | `JSEARCH_API_KEY` env var | `x-api-key` header; OpenWebNinja API |
 | Tavily | `TAVILY_API_KEY` env var | Tavily Python client singleton |
 | Claude models | `ANTHROPIC_API_KEY` env var | All agents via Deep Agents |
 | GPT-4.1-nano | `OPENAI_API_KEY` env var | Job description summarizer inside `jsearch_request` only |
 | LangSmith | `LANGSMITH_API_KEY` + `LANGCHAIN_TRACING_V2=true` | Automatic run tracing; no code changes needed |
+
+---
+
+## CLI Reference
+
+```bash
+uv run python main.py                                           # chat (continues chat-main thread)
+uv run python main.py --thread my-session                      # chat with named thread
+uv run python main.py gmail                                     # Gmail trigger (default query, 60s poll)
+uv run python main.py gmail --query "is:unread label:jobs"     # custom Gmail query
+uv run python main.py gmail --interval 30                      # poll every 30s
+```
